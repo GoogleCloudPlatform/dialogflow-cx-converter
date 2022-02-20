@@ -139,7 +139,7 @@ dmypy.json
 cython_debug/
 
 # Dev
-credentials.json
+*.json
 
 # Mac
 .DS_Store%        
