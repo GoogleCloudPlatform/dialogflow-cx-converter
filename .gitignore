@@ -140,6 +140,10 @@ cython_debug/
 
 # Dev
 *.json
+*.csv
+*.xlsx
+*.png
+local/
 
 # Mac
-.DS_Store%        
+.DS_Store  
