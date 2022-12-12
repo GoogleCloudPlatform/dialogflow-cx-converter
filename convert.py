@@ -1,9 +1,9 @@
 import argparse
 import json
 import time
-from typing import List, Dict
+from typing import List, Dict, Tuple
+from dataclasses import dataclass
 
-from google.protobuf import message
 import proto
 
 from google.cloud.dialogflowcx_v3beta1 import types, FlowsClient, AgentsClient
@@ -36,6 +36,14 @@ class Agent():
     """A class to store multiple Watson workspaces"""
     def __init__(self, assuntos: List[Flow]) -> None:
         self.assuntos = assuntos
+
+@dataclass
+class Expression:
+    sub_expressions: Dict[str, 'Expression']
+    operations: Dict[str, str]
+    intents: List[str]
+    condition: List[str]
+    events: List[str]
 
 # Help Function
 def wait_for_time(requests_per_minute: dict):
@@ -141,29 +149,77 @@ def parse_condition_tokens(token: str):
     
     return token_type, converted
 
+def tokenize_literals(conditions: str) -> Tuple[str, dict, int]:
+    token_count = 0
+    token_map = {}
+    while '"' in conditions:
+        first = conditions.find('"')
+        second = conditions[first + 1:].find('"') + first + 1
+        token_key = f"&|{token_count}"
+        token_count += 1
+        token_map[token_key] = conditions[first:second + 1]
+        conditions = conditions[:first] + conditions[second+1:]
 
-def parse_expression(expression: str):
+    return conditions, token_map, token_count
+
+def parse_expression(expression: str) -> Tuple[Expression, int, int]:
+    
     first_open_parenthesis = expression.find("(")
-    if first_open_parenthesis != -1:
+    sub_expression_count = 0
+    sub_expressions ={}
+    intents = []
+    events = []
+    overall_start = len(expression)
+    overall_end = 0
+
+    # [TODO] Parse Parenthesis
+    while first_open_parenthesis:
         first_close_parenthesis = expression.find(")")
         second_open_parenthesis = expression[first_open_parenthesis + 1:].find("(") + first_open_parenthesis + 1
         if second_open_parenthesis > first_close_parenthesis or second_open_parenthesis == -1:
             sub_expression, start, end = parse_expression(expression[first_open_parenthesis+1:first_close_parenthesis]) # type: ignore
         else:
             sub_expression, start, end = parse_expression(expression[second_open_parenthesis+1:]) # type: ignore
+        sub_expressions[f"({sub_expression_count})"] = sub_expression
+        intents += sub_expression.intents
+        overall_start = min(overall_start, start)
+        overall_end = max(overall_end, end)
+
     else:
-        # [TODO] break into tokens taking account for quotes
         tokens = expression.split()
+        converted_tokens = []
         for token in tokens:
-            if token in ["||", "&&", ">", ">=", "<", "<="]:
-                pass
+            if token in ["||", "&&", ">", ">=", "<", "<="] or token.startswith("("):
+                converted_tokens.append(token)
+            else:
+                token_type, converted = parse_condition_tokens(token)
+                if token_type in ["no_match", "start"]:
+                    events.append(token_type)
+                elif token_type == "intent":
+                    intents.append(converted)
+                else:
+                    converted_tokens.append(converted)
 
-
-def parse_conditions(conditions: str):
     
-    # Verify parenthesis
-    # Intent or - Two routes
-    special_conditions = []
+    expression_obj = Expression(
+        sub_expressions=sub_expressions,
+        operations={},
+        intents=intents,
+        events=events,
+        condition=[expression])
+
+    return expression_obj, overall_start, overall_end
+
+
+def parse_conditions(conditions: str) -> Tuple[Expression, dict, int]:
+    
+    # Tokenize Literals
+    conditions, token_map, token_count = tokenize_literals(conditions)
+
+    expression, _, _ = parse_expression(conditions)
+
+    return expression, token_map, token_count
+
 
 # Creation Functions
 def create_or_get_agent(
@@ -438,18 +494,12 @@ def create_or_get_pages(
                     continue
                 intent_id = ""
                 conditions = page.get("conditions","")
-                # Validate conditions
-                if len(conditions) > 2:
-                    c_symbol = conditions[0]
-                    if c_symbol == "#":
-                        for intent in intents:
-                            if intent.display_name == conditions[1:]:
-                                intent_id = intent.name
-                                print("Found intent for page")
-                # [TODO] Include other conditions like true, false, welcome    
-                if not intent_id:
-                    print("pulei 2")
+                if conditions == "":
                     continue
+                expression, token_map, token_count = parse_conditions(conditions)
+                if not (expression.condition or expression.intents):
+                    continue
+                # Validate conditions
                 messages = [
                     types.ResponseMessage(
                         text=types.ResponseMessage.Text(
@@ -485,7 +535,8 @@ def create_or_get_pages(
                     target_flow=flow_id
                 )
                 flow_transitions.append(transition_route)
-                transitions_flows.append(transition_route_flow) # type: ignore            
+                transitions_flows.append(transition_route_flow) # type: ignore
+                # [TODO] Implement Page Transitions      
             
             print("Finished flow pages")
             if flow_transitions:
