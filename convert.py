@@ -2,10 +2,10 @@ import argparse
 import json
 import time
 from typing import List, Dict, Tuple, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from google.cloud.dialogflowcx_v3beta1 import types, FlowsClient, AgentsClient
-from google.api_core.exceptions import InvalidArgument
+from google.api_core.exceptions import InvalidArgument, AlreadyExists, FailedPrecondition
 from dfcx_scrapi.core.agents import Agents
 from dfcx_scrapi.core.entity_types import EntityTypes
 from dfcx_scrapi.core.intents import Intents
@@ -14,18 +14,17 @@ from dfcx_scrapi.core.pages import Pages
 
 
 #========= Dialogflow Constants ===============================================
-QUOTA_ADMIN_REQUESTS_PER_MINUTE = 60
-QUOTA_REFRESH_SECONDS_ADMIN_REQUESTS_PER_MINUTE = 120
+QUOTA_REQUESTS = 60
+QUOTA_REQUESTS_WINDOW_IN_SECONDS = 60
 
 
 #========= Help Constants =====================================================
-REQUESTS_LIMIT = QUOTA_ADMIN_REQUESTS_PER_MINUTE
-REQUESTS_REFRESH = QUOTA_REFRESH_SECONDS_ADMIN_REQUESTS_PER_MINUTE + 10
-REQUESTS_BUFFER = QUOTA_REFRESH_SECONDS_ADMIN_REQUESTS_PER_MINUTE
+REQUESTS_LIMIT = QUOTA_REQUESTS // 2
+REQUESTS_REFRESH = QUOTA_REQUESTS_WINDOW_IN_SECONDS * 2
 
 
 #========= Classes ============================================================
-class Flow():
+class Flow:
     """A class to store a Watson workspace"""
     def __init__(self, input_dict: dict) -> None:
         self.workspace = input_dict.get("workspace", input_dict)
@@ -36,37 +35,46 @@ class Flow():
         self.pages = self.workspace["dialog_nodes"]
 
 
-class Agent():
+class Agent:
     """A class to store multiple Watson workspaces"""
     def __init__(self, assuntos: List[Flow]) -> None:
         self.assuntos = assuntos
 
 
 @dataclass
-class Node():
+class Node:
     parent: Union["Node",None] = None
-    children: List["Node"] = []
-    page: dict = {}
+    children: List["Node"] = field(default_factory=list)
+    page: dict = field(default_factory=dict)
     flow_id: str = ""
+    jump_to: bool = False
 
 
 @dataclass
 class Expression:
-    operations: Dict[str, str]
-    intents: List[str]
-    condition: str
-    events: List[str]
+    operations: Dict[str, str] = field(default_factory=dict)
+    intents: List[str] = field(default_factory=list)
+    condition: str = ""
+    events: List[str] = field(default_factory=list)
 
 
 #========= Help Function ======================================================
+def is_number(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
 def wait_for_time(requests_per_minute: dict):
     """Function to wait for quota"""
-    time.sleep(1)
+    time.sleep(60 // REQUESTS_LIMIT)
     now = time.time()
-    if now - REQUESTS_BUFFER > requests_per_minute["time"]:
+    if now - QUOTA_REQUESTS_WINDOW_IN_SECONDS > requests_per_minute["time"]:
         requests_per_minute["time"] = now
         requests_per_minute["request_count"] = 0
-    elif requests_per_minute["request_count"] + 1 > REQUESTS_LIMIT:
+    
+    if requests_per_minute["request_count"] + 1 > REQUESTS_LIMIT:
         time.sleep(REQUESTS_REFRESH-(now-requests_per_minute["time"]))
         requests_per_minute["time"] = time.time()
         requests_per_minute["request_count"] = 0
@@ -101,12 +109,21 @@ def parse_condition_tokens(token: str):
     if len(token) > 0:
 
         if ".contains(" in token:
-            tokens: List[str] = token[:-1].split(".contains(")
-            if tokens != None and len(tokens) == 2:
-                _, token_string = parse_condition_tokens(tokens[0]) # type: ignore 
-                _, token_substring = parse_condition_tokens(tokens[1]) # type: ignore 
-                token_type = "contains"
-                converted = f"{token_string} : {token_substring}"
+            if token[0] == "[":
+                tokens = token[:-1].split(".contains(")
+                print(tokens)
+                item_list = tokens[0].replace("[", "").replace("]", "").split(",")
+                print(item_list)
+                converted_list = [parse_condition_tokens(item)[1] for item in item_list]
+                _, converted_contain = parse_condition_tokens(tokens[1])
+                converted = f"$sys.func.CONTAIN([{','.join(converted_list)}], {converted_contain})"
+            else:
+                tokens: List[str] = token[:-1].split(".contains(")
+                if tokens != None and len(tokens) == 2:
+                    _, token_string = parse_condition_tokens(tokens[0]) # type: ignore 
+                    _, token_substring = parse_condition_tokens(tokens[1]) # type: ignore 
+                    token_type = "contains"
+                    converted = f"{token_string} : {token_substring}"
         
         elif "entities.size()" in token:
             token_type = "params_final"
@@ -118,7 +135,7 @@ def parse_condition_tokens(token: str):
         
         elif token[0] == "!":
             token_type = "negation"
-            _, converted = parse_condition_tokens(token[1:])
+            token_type, converted = parse_condition_tokens(token[1:])
             converted = f"NOT {converted}"
 
         elif token[0] == "[":
@@ -130,16 +147,15 @@ def parse_condition_tokens(token: str):
             converted = token[1:]
         
         elif token[0] == '@' or token[0] == '$':
-            if "." in token:
+            if "." in token and "(" in token:
                 token_type = "function"
                 converted = "0"
-
 
             elif ":" in token:
                 token_type = "entity_value"
                 tokens = token.split(":")
                 tokens[1] = tokens[1].replace("(", "").replace(")", "")
-                converted = f"$session.params.{tokens[0]} == '{tokens[1]}'"
+                converted = f"$session.params.{tokens[0][1:]} = '{tokens[1]}'"
             else:
                 token_type = "entity"
                 converted = f"$session.params.{token[1:]}"
@@ -188,21 +204,37 @@ def tokenize_literals(conditions: str) -> Tuple[str, dict, int]:
         second = conditions[first + 1:].find('"') + first + 1
         token_key = f"&|{token_count}"
         token_count += 1
+        token_map[token_key] = conditions[first:second + 1].replace('"', "'")
+        conditions = conditions[:first] + token_key + conditions[second+1:]
+    
+    while "'" in conditions:
+        first = conditions.find("'")
+        second = conditions[first + 1:].find("'") + first + 1
+        token_key = f"&|{token_count}"
+        token_count += 1
         token_map[token_key] = conditions[first:second + 1]
-        conditions = conditions[:first] + conditions[second+1:]
+        conditions = conditions[:first] + token_key + conditions[second+1:]
+    
+    while ':(' in conditions:
+        first = conditions.find(':(')
+        second = conditions[first + 1:].find(')') + first + 1
+        token_key = f"&|{token_count}"
+        token_count += 1
+        token_map[token_key] = conditions[first+2:second]
+        conditions = conditions[:first+1] + token_key + conditions[second+1:]
 
     return conditions, token_map, token_count
 
 
 def parse_expression(
     expression: str,
-    subexpressions: dict ={},
+    subexpressions: Dict[str, Expression] ={},
     subexpression_count: int = 0) -> Tuple[Expression, dict, int]:
     
     intents = []
     events = []
 
-    if len(expression) > 0:
+    if len(expression) > 1:
         if expression[-1] == ")":
             expression += " "
         parenthesis_count = expression.count(") ")
@@ -213,93 +245,188 @@ def parse_expression(
         while parenthesis_count>=0:
 
             first_close_parenthesis = expression[start:].find(") ") + start
+
             if first_close_parenthesis == -1:
                 break
             end = min(end, first_close_parenthesis)
             closest_open_parenthesis = expression[:end].rfind("(")
             if closest_open_parenthesis == -1:
-                break
+                start = first_close_parenthesis + 1
+                parenthesis_count -= 1
+                continue
 
             if closest_open_parenthesis > 0:
                 if expression[closest_open_parenthesis-1] != " ":
-                    parenthesis_count -= 1
-                    start = first_close_parenthesis
                     end = closest_open_parenthesis
+                    start = first_close_parenthesis + 1
+                    parenthesis_count -= 1
                     continue
             
+            print(expression[closest_open_parenthesis+1:first_close_parenthesis])
+
             subexpression, subexpressions, subexpression_count = parse_expression(
                 expression[closest_open_parenthesis+1:first_close_parenthesis],
                 subexpressions=subexpressions,
                 subexpression_count=subexpression_count)
+            
+            subexpression_str = ""
 
-            subexpression_key = f"&|({subexpression_count})|&"
-            subexpression_count += 1
-            subexpressions[subexpression_key] = subexpression
+            if subexpression.condition:
+                subexpression_key = f"&|({subexpression_count})|&"
+                subexpression_str = f" {subexpression_key} " if subexpression.condition else ""
+                subexpression_count += 1
+                subexpressions[subexpression_key] = subexpression
 
             intents += subexpression.intents
 
-            print(expression)
-            print(closest_open_parenthesis)
-            print(first_close_parenthesis)
-
-            expression = expression[:closest_open_parenthesis] + " " + subexpression_key + " " + expression[first_close_parenthesis+1:]
-
-            print(expression)
+            expression = expression[:closest_open_parenthesis] + subexpression_str + expression[first_close_parenthesis+1:]
+            expression = expression.replace("    ", " ")
             
             start = 0
             end = len(expression)
             parenthesis_count -= 1
         
-
+        expression = expression.replace(") )", ")")
         tokens = expression.split()
 
 
         converted_tokens = []
+        empty = True
         comparison_flag = False
         intent_or_event_flag = False
+        entity_flag = False
+        or_and_flag = False
         remove_next = False
+        operation = ""
+
         for token in tokens:
             is_last_comparison = comparison_flag
             is_last_intent_or_event = intent_or_event_flag
+            is_last_entity = entity_flag
+            is_last_or_and = or_and_flag
             comparison_flag = False
             intent_or_event_flag = False
+            entity_flag = False
+            or_and_flag = False
+
 
             if remove_next:
                 remove_next = False
                 continue
-            if token in ["||", "&&", ">", ">=", "<", "<="]:
-                if is_last_intent_or_event:
+
+            #[TODO] + - 
+            if token in ["+", "-"]:
+                if empty or operation:
                     remove_next = True
+                    operation = ""
                     continue
 
-                if token == "||":
-                    token = "OR"
-                elif token == "&&":
-                    token = "AND"
+                if token == "+":
+                    operation = f"$sys.func.ADD({converted_tokens.pop()},"
+                else:
+                    operation = f"$sys.func.MINUS({converted_tokens.pop()},"
+
                 
+
+            elif token in ["||", "&&", ">", ">=", "<", "<=", "==", "!=", "+", "-"]:
+
+                if operation:
+                    operation = ""
+                    continue
+
+                if token in ["||", "&&"]:
+                    if empty or is_last_intent_or_event or is_last_or_and:
+                        continue
+                    else:
+                        or_and_flag = True
+                    token = "OR" if token == "||" else "AND"
+                else:
+                    if empty:
+                        remove_next = True
+                        continue
+                    if token == "==":
+                        token = "="
+                    if is_last_intent_or_event:
+                        remove_next = True
+                        continue
+                    
+                    else:
+                        comparison_flag = True
+                        is_last_entity = False
+                
+                if is_last_entity:
+                    converted_tokens.append("!=")
+                    converted_tokens.append("null")
+                
+                
+
                 converted_tokens.append(token)
-                comparison_flag = True
-            elif (token.startswith("&|(")):
+                
+            elif (token.startswith("&|(")) or token.startswith("&|"):
+                if operation:
+                    operation = ""
+                    continue
+
+                if empty:
+                    if token.startswith("&|("):
+                        if subexpressions.get(
+                            token, Expression()).condition.strip():
+                            empty = False
+                    else:
+                        empty = False
                 converted_tokens.append(token)
+            elif is_number(token):
+                if operation:
+                    token = operation + token + ")"
+                    operation = ""
+                converted_tokens.append(token)
+                empty = False
             else:
                 token_type, converted = parse_condition_tokens(token)
                 if token_type in ["no_match", "start"]:
+                    if operation:
+                        operation = ""
                     events.append(token_type)
                     intent_or_event_flag = True
-                    if is_last_comparison:
+                    if is_last_comparison or is_last_or_and:
                         converted_tokens.pop()
+                elif token_type in ["true", "false"]:
+                    converted_tokens.append(token)
                 elif token_type == "intent":
+                    if operation:
+                        operation = ""
                     intents.append(converted)
                     intent_or_event_flag = True
-                    if is_last_comparison:
+                    if is_last_comparison or is_last_or_and:
                         converted_tokens.pop()
                 elif token_type in ["intents", "params_final", "checkTime", "function"]:
+                    if operation:
+                        operation = ""
                     intent_or_event_flag = True
-                    if is_last_comparison:
+                    if is_last_comparison or is_last_or_and:
                         converted_tokens.pop()
+                elif token_type == "entity":
+                    if not is_last_comparison:
+                        entity_flag = True
+                    if operation:
+                        token = operation + token + ")"
+                        operation = ""
+                    converted_tokens.append(converted)
+                    empty = False
+                elif token_type == "entity_value":
+                    if operation:
+                        operation = ""
+                    converted_tokens.append(converted)
+                    empty = False
                 else:
+                    if operation:
+                        operation = ""
                     converted_tokens.append(converted)
         
+        if entity_flag:
+            converted_tokens.append("!=")
+            converted_tokens.append("null")
+
         expression = " ".join(converted_tokens)
     
     expression_obj = Expression(
@@ -314,28 +441,33 @@ def parse_expression(
 def parse_conditions(conditions: str) -> Expression:
     
     conditions = conditions.replace("((", "( (").replace("))", ") )")
+    
     # Tokenize Literals
     conditions, token_map, token_count = tokenize_literals(conditions)
 
-    expression, subexpressions, _ = parse_expression(conditions)
+    expression, subexpressions, _ = parse_expression(conditions, {}, 0)
 
     condition = expression.condition
+    
+    if condition:
+        while subexpressions:
+            converted_tokens = []
+            tokens = condition.split()
+            for token in tokens:
+                if (token.startswith("&|(")):
+                    if subexpressions[token].condition.strip():
+                        converted_tokens.append("(")
+                        converted_tokens.append(subexpressions[token].condition)
+                        converted_tokens.append(")")
+                    del subexpressions[token]
+                else:
+                    converted_tokens.append(token)
+            
+            condition = " ".join(converted_tokens)
 
-    while subexpressions:
-        converted_tokens = []
-        tokens = condition.split()
-        for token in tokens:
-            if (token.startswith("&|(")):
-                converted_tokens.append(subexpressions[token].condition)
-                del subexpressions[token]
-            else:
-                converted_tokens.append(token)
-        
-        condition = " ".join(converted_tokens)
-
-    if token_count:
-        for k, v in token_map.items():
-            condition = condition.replace(k,v)
+        if token_count:
+            for k, v in token_map.items():
+                condition = condition.replace(k,v)
     
     expression.condition = condition
 
@@ -368,16 +500,17 @@ def create_node_tree(assunto: Flow) -> Tuple[Dict[str, Node], Dict[str, Node]]:
             # conversation_start indicates first node
             if "conversation_start" in page.get("conditions", ""):
                 pages[page["dialog_node"]].parent = roots["start"]
-            
-            # Add as root
-            roots[page["dialog_node"]] = pages[page["dialog_node"]]
+                roots["start"].children.append(pages[page["dialog_node"]])
+            else:
+                # Add as root
+                roots[page["dialog_node"]] = pages[page["dialog_node"]]
         # Nodes for pages with a parent
         else:
             # If parent node does not exist, creates a placeholder
             if not pages.get(page["parent"], ""):
                 pages[page["parent"]] = Node()
             
-            parent = pages.get(page["parent"])
+            parent = pages[page["parent"]]
             flow_id = ""
             parents = []
             
@@ -402,6 +535,19 @@ def create_node_tree(assunto: Flow) -> Tuple[Dict[str, Node], Dict[str, Node]]:
                         child.flow_id = flow_id
                 pages[page["dialog_node"]].page = page
                 pages[page["dialog_node"]].flow_id = flow_id
+
+            pages[page["parent"]].children.append(pages[page["dialog_node"]])
+        
+        if "next_step" in page:
+            page_next_step = page["next_step"]
+            if page_next_step.get("behavior","") == "jump_to":
+                dialog_node_id = page_next_step.get("dialog_node", "")
+                if dialog_node_id:
+                    if not pages.get(dialog_node_id, ""):
+                        pages[dialog_node_id] = Node(
+                            jump_to=True)
+                    else:
+                        pages[page["dialog_node"]].jump_to = True
     
     return pages, roots
         
@@ -428,6 +574,7 @@ def create_or_get_agent(
         )
         print(agent)
     else:
+        wait_for_time(requests_per_minute)
         agent = agents_functions.get_agent_by_display_name(
             project_id, display_name)
     return agent
@@ -477,6 +624,7 @@ def create_or_get_entity_types(
                 entity_types_names.append(entity["entity"])
         print("Finished Entities")
     else:
+        wait_for_time(requests_per_minute)
         entity_types = entity_types_functions.list_entity_types(
             agent_id=str(agent.name))
     
@@ -633,6 +781,7 @@ def create_or_get_flows(
                     flows[str(page["dialog_node"])] = flows_client.create_flow(
                     parent=str(agent.name),flow=flow_obj)
     else:
+        wait_for_time(requests_per_minute)
         flows_list = flows_functions.list_flows(str(agent.name))
         if parentless_folders_as_flows:
             assunto = bot.assuntos[0]
@@ -648,6 +797,7 @@ def create_or_get_flows(
 
     
     if intents_as_routes:
+        wait_for_time(requests_per_minute)
         start_flow_obj = flows_functions.get_flow(str(agent.start_flow))
         transition_routes = start_flow_obj.transition_routes
         for intent in intents:
@@ -667,28 +817,37 @@ def create_or_get_flows(
                 )
             transition_routes.append(transition_route) # type: ignore
         start_flow_obj.transition_routes = transition_routes
+        wait_for_time(requests_per_minute)
         start_flow_obj = flows_functions.update_flow(
                     flow_id=str(start_flow_obj.name),
                     obj=start_flow_obj
                 )
-    
+
     return flows
 
 
-def create_child_page(page, pages, flow_name, flows_functions, pages_functions, flow, agent, requests_per_minute, parent):
+def create_child_page(
+    page: Node,
+    pages: Dict[str, dict],
+    intents,
+    flow_name: str,
+    flow_id: str,
+    flows_functions: Flows,
+    pages_functions: Pages,
+    requests_per_minute: dict,
+    parent: Union[types.Flow, types.Page]):
+    
     page_dict = page.page
     if page_dict.get("type", "standard") not in [
         "standard", "folder", "response_condition"]:
+        print("not the right type")
         return
 
     if not page_dict.get("conditions", ""):
+        print("no condition")
         return
 
     expression = parse_conditions(page_dict["conditions"])
-
-    # [TODO] Group Response Condition
-    if page_dict.get("type", "standard") == "response_condition":
-        pass
     
     messages = [
         types.ResponseMessage(
@@ -710,62 +869,171 @@ def create_child_page(page, pages, flow_name, flows_functions, pages_functions, 
         messages=messages,
         set_parameter_actions=parameter_actions)
     
-    dialog_node_id = page.page["dialog_node"]
+    dialog_node_id = str(page.page["dialog_node"])
 
-    child_page = types.Page(
-        display_name = page.page.get(
-            "title",
-            dialog_node_id)
-    )
+    page_target = False
 
-    wait_for_time(requests_per_minute)
-    pages[flow_name][
-        "pages"][dialog_node_id] = pages_functions.create_page(
-        flow_name,
-        child_page)
+    if page.children or page.jump_to:
+        if page_dict.get("type", "standard") != "response_condition":
+            child_page = types.Page(
+                display_name = page.page.get(
+                    "title",
+                    dialog_node_id)
+            )
+        else:
+            child_page = types.Page(
+                display_name = dialog_node_id
+            )
+        
+        if not flow_name in pages:
+            pages[flow_name] = {
+                "pages": {}
+            }
+
+        wait_for_time(requests_per_minute)
+        try:
+            pages[flow_name][
+                "pages"][dialog_node_id] = pages_functions.create_page(
+                flow_id,
+                child_page)
+            page_target = True
+        except FailedPrecondition as e:
+            print(e)
+            return
+        except AlreadyExists as e:
+            print(e)
+            try:
+                child_page = types.Page(
+                    display_name = dialog_node_id
+                )
+                pages[flow_name][
+                    "pages"][dialog_node_id] = pages_functions.create_page(
+                    flow_id,
+                    child_page)
+                page_target = True
+            except AlreadyExists as e:
+                print(e)
+                wait_for_time(requests_per_minute)
+                pages_map = pages_functions.get_pages_map(flow_id, reverse=True)
+                page_id = str(pages_map.get(dialog_node_id, pages_map.get(page.page.get("title", ""))))
+                wait_for_time(requests_per_minute)
+                pages[flow_name][
+                    "pages"][dialog_node_id] = pages_functions.get_page(page_id)
     
-    transition_route = types.TransitionRoute(
-        target_page=pages[flow_name]["pages"][dialog_node_id].name,
-        trigger_fulfillment=fullfillment,
-        condition=expression.condition if expression.condition else None
-    )
+    if expression.condition or expression.intents or expression.events:
+        intent_ids = []
+        update_parent = False
 
-    parent.transition_routes.append(transition_route) # type: ignore
+        if len(expression.intents) > 0:
+            for expression_intent in expression.intents:
+                for intent in intents:
+                    if intent.display_name == expression_intent:
+                        intent_ids.append(intent.name)
+        
+        if len(expression.events) > 0:
+            for expression_event in expression.events:
+                if expression_event == "start":
+                    if not "Default Welcome Intent" in expression.intents:
+                        for intent in intents:
+                            if intent.display_name == "Default Welcome Intent":
+                                intent_ids.append(intent.name)
+        
+        if intent_ids:
+            for intent_id in intent_ids:
+                transition_route = types.TransitionRoute(
+                    intent=intent_id,
+                    target_page=pages[flow_name]["pages"][dialog_node_id].name if page_target else None,
+                    trigger_fulfillment=fullfillment,
+                    condition=expression.condition if expression.condition else None
+                )
+                parent.transition_routes.append(transition_route) # type: ignore
+                update_parent = True
+        elif expression.condition:
+            transition_route = types.TransitionRoute(
+                target_page=pages[flow_name]["pages"][dialog_node_id].name if page_target else None,
+                trigger_fulfillment=fullfillment,
+                condition=expression.condition
+            )
+            parent.transition_routes.append(transition_route) # type: ignore
+            update_parent = True
 
-    wait_for_time(requests_per_minute)
-
-    if type(parent) == types.Flow:
-        flows_functions.update_flow(parent.name, parent)
-    else:
-        pages_functions.update_page(parent.name, parent)
+        if update_parent:
+            wait_for_time(requests_per_minute)
+            try:
+                if type(parent) == types.Flow:
+                    parent = flows_functions.update_flow(str(parent.name), parent) # type: ignore
+                else:
+                    parent = pages_functions.update_page(str(parent.name), parent) # type: ignore
+            except InvalidArgument as e:
+                print(e)
+                if intent_ids:
+                    for intent_id in intent_ids:
+                        parent.transition_routes.pop() # type: ignore
+                else:
+                    parent.transition_routes.pop() # type: ignore
+                print(f"Original condition: {page_dict['conditions']}")
 
     for child in page.children:
         create_child_page(
             child,
             pages,
+            intents,
             flow_name,
+            flow_id,
             flows_functions,
             pages_functions,
-            flow, agent,
             requests_per_minute,
             pages[flow_name]["pages"][dialog_node_id])
 
 
-def create_jump_to_routes(name, page, pages, requests_per_minute, pages_functions):
-    # [TODO] Create Jump to Flow
-    if not pages.get(name, None):
+def create_jump_to_routes(
+    name: str,
+    page: Node,
+    pages: Dict[str, dict],
+    flows: Dict[str, types.Flow],
+    requests_per_minute: dict,
+    pages_functions: Pages):
+
+    if not page.flow_id:
+        print("no flow id")
         return
+    
+    if not pages.get(page.flow_id, ""):
+        print("flow not found in pages")
+        return
+
+    if not pages[page.flow_id]["pages"].get(name, None):
+        print("page not found in pages")
+        return
+    
     page_dict = page.page
     if "next_step" not in page_dict:
+        print("next step not found")
         return
     page_next_step = page_dict["next_step"]
     if page_next_step.get("behavior","") != "jump_to":
+        print("jump to not found")
         return
     
-    # [TODO] search for id
-    page_id = page_next_step.get("dialog_node", "")
-    if not page_id:
+
+    dialog_node_id = page_next_step.get("dialog_node", "")
+    if not dialog_node_id:
+        print("next page not found")
         return
+    
+    page_id = ""
+    flow_id = ""
+
+    if dialog_node_id == page.flow_id:
+        flow_id = str(flows[dialog_node_id].name)
+    else:
+        page_id = str(pages[page.flow_id]["pages"].get(dialog_node_id, ""))
+        if not page_id:
+            print("target page id not found")
+            return
+        
+
+
     messages = [
         types.ResponseMessage(
             text=types.ResponseMessage.Text(text=[value])
@@ -787,7 +1055,8 @@ def create_jump_to_routes(name, page, pages, requests_per_minute, pages_function
         set_parameter_actions=parameter_actions)
 
     transition_route = types.TransitionRoute(
-        target_page=page_id,
+        target_page=page_id if page_id else None,
+        target_flow=flow_id if flow_id else None,
         trigger_fulfillment=fullfillment,
         condition="true"
     )
@@ -801,9 +1070,10 @@ def create_pages_folders_as_flows(
     bot: Agent,
     agent: types.Agent,
     flows: Dict[str, types.Flow],
+    pages: Dict[str, dict],
+    intents: List[types.Intent],
     flows_functions: Flows,
     pages_functions: Pages,
-    pages: Dict[str, dict],
     requests_per_minute: dict
     ) -> Dict[str, dict]:
     
@@ -812,26 +1082,35 @@ def create_pages_folders_as_flows(
     for name, tree in trees.items():
         # Start flow
         if name == "start":
+            print("start")
+            wait_for_time(requests_per_minute)
             start_flow = flows_functions.get_flow(str(agent.start_flow))
-            start_flow_name = str(start_flow.name)
             for child in tree.children:
-                create_child_page(child, pages, start_flow_name, flows_functions, pages_functions, start_flow, agent, requests_per_minute, start_flow)
+                print("start_child")
+                create_child_page(child, pages, intents, name, str(start_flow.name), flows_functions, pages_functions, requests_per_minute, start_flow)
 
         # Creation for other  flows
         elif name in flows:
-            flow = flows_functions.get_flow(name)
-            flow_name = str(flow.name)
+            wait_for_time(requests_per_minute)
+            flow = flows[name]
             for child in tree.children:
-                create_child_page(child, pages, flow_name, flows_functions, pages_functions, flow, agent, requests_per_minute, flow)
+                create_child_page(child, pages, intents, name, str(flow.name), flows_functions, pages_functions, requests_per_minute, flow)
     
     # Create jump_to routes:
     for name, page in page_nodes.items():
-        create_jump_to_routes(name, page, pages, requests_per_minute, pages_functions)
+        create_jump_to_routes(name, page, pages, flows, requests_per_minute, pages_functions)
     
     return pages
 
 
-def create_pages_multiflow(bot, flows, pages, intents, requests_per_minute, pages_functions, flows_functions) -> Dict[str, dict]:
+def create_pages_multiflow(
+    bot,
+    flows,
+    pages,
+    intents,
+    requests_per_minute,
+    pages_functions,
+    flows_functions) -> Dict[str, dict]:
     for assunto in bot.assuntos:
         is_parent_pages = {page["dialog_node"]: False for page in assunto.pages}
         for page in assunto.pages:
@@ -946,7 +1225,7 @@ def create_pages_multiflow(bot, flows, pages, intents, requests_per_minute, page
                     try:
                         pages_functions.update_page(str(p_page_obj.name), p_page_obj)
                     except InvalidArgument as e:
-                        pass
+                        print(e)
                 else:
                     wait_for_time(requests_per_minute)
                     backup_routes = list(flow_obj.transition_routes).copy() # type: ignore
@@ -956,6 +1235,7 @@ def create_pages_multiflow(bot, flows, pages, intents, requests_per_minute, page
                         flows_functions.update_flow(str(flow_obj.name), flow_obj)
                         flows[flow_idx] = flow_obj
                     except InvalidArgument as e:
+                        print(e)
                         flow_obj.transition_routes = backup_routes # type: ignore
         
         print("Finished flow pages")
@@ -1008,12 +1288,13 @@ def create_or_get_pages(
 
     if create_pages:
         if parentless_folders_as_flows:
-            return create_pages_folders_as_flows(bot, agent, flows, flows_functions,pages_functions, pages, requests_per_minute)
+            return create_pages_folders_as_flows(bot, agent, flows, pages, intents, flows_functions, pages_functions, requests_per_minute)
         else:
             return create_pages_multiflow(bot, flows, pages, intents, requests_per_minute, pages_functions, flows_functions)
 
     else:
         for flow in flows:
+            wait_for_time(requests_per_minute)
             pages[str(flows[flow].name)]["pages"] = pages_functions.list_pages(flow_id=str(flows[flow].name))
 
     
