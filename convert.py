@@ -1,16 +1,27 @@
+"""
+ Copyright 2023 Google LLC
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+      https://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ """
+
 import argparse
 import json
 import time
 from typing import List, Dict, Tuple, Union
 from dataclasses import dataclass, field
 
-from google.cloud.dialogflowcx_v3beta1 import types, FlowsClient, AgentsClient
+from google.cloud.dialogflowcx_v3beta1 import types, AgentsClient, EntityTypesClient, FlowsClient, IntentsClient, PagesClient
 from google.api_core.exceptions import InvalidArgument, AlreadyExists, FailedPrecondition
-from dfcx_scrapi.core.agents import Agents
-from dfcx_scrapi.core.entity_types import EntityTypes
-from dfcx_scrapi.core.intents import Intents
-from dfcx_scrapi.core.flows import Flows
-from dfcx_scrapi.core.pages import Pages
 
 
 #========= Dialogflow Constants ===============================================
@@ -27,9 +38,13 @@ REQUESTS_REFRESH = QUOTA_REQUESTS_WINDOW_IN_SECONDS * 2
 class Flow:
     """A class to store a Watson workspace"""
     def __init__(self, input_dict: dict) -> None:
+        # Check for workspace key inside dict or just use the dict
         self.workspace = input_dict.get("workspace", input_dict)
-        # A map for text outputs
+
+        # Check for answer mapping in the dict
         self.answers = input_dict.get("answers", [])
+
+        # Common keys
         self.intents = self.workspace["intents"]
         self.entities = self.workspace["entities"]
         self.pages = self.workspace["dialog_nodes"]
@@ -43,6 +58,7 @@ class Agent:
 
 @dataclass
 class Node:
+    """A data class for recreating the Watson tree"""
     parent: Union["Node",None] = None
     children: List["Node"] = field(default_factory=list)
     page: dict = field(default_factory=dict)
@@ -52,6 +68,7 @@ class Node:
 
 @dataclass
 class Expression:
+    """A data class for recreating the Watson expression"""
     operations: Dict[str, str] = field(default_factory=dict)
     intents: List[str] = field(default_factory=list)
     condition: str = ""
@@ -60,6 +77,7 @@ class Expression:
 
 #========= Help Function ======================================================
 def is_number(s: str) -> bool:
+    """A help function to check if the string is a number"""
     try:
         float(s)
         return True
@@ -67,7 +85,7 @@ def is_number(s: str) -> bool:
         return False
 
 def wait_for_time(requests_per_minute: dict):
-    """Function to wait for quota"""
+    """A help function to wait for quota"""
     time.sleep(60 // REQUESTS_LIMIT)
     now = time.time()
     if now - QUOTA_REQUESTS_WINDOW_IN_SECONDS > requests_per_minute["time"]:
@@ -84,6 +102,7 @@ def wait_for_time(requests_per_minute: dict):
 
 def parse_condition_tokens(token: str):
     """
+    A help function to parse condition tokens
     # - intents
     @ - entities
     @{entity-name}:{value} - Value of entity
@@ -102,7 +121,7 @@ def parse_condition_tokens(token: str):
     entities.size(): Change to true or page form completed
     time.plusHours/plusMinutes(): Not implemented
     """
-    # [TODO] plus minutes, plus hours
+    # [TODO] plus minutes, plus hours, webhook needed
     token_type = "unknown"
     converted = token
 
@@ -125,10 +144,12 @@ def parse_condition_tokens(token: str):
                     token_type = "contains"
                     converted = f"{token_string} : {token_substring}"
         
+        # This is not posible in Dialogflow, check for entities
         elif "entities.size()" in token:
             token_type = "params_final"
             converted = '($page.params.status = "FINAL" || true)'
-
+        
+        # This is not posible in Dialogflow
         elif token.startswith("intents["):
             token_type = "intents"
             converted = 'true'
@@ -197,6 +218,7 @@ def parse_condition_tokens(token: str):
 
 
 def tokenize_literals(conditions: str) -> Tuple[str, dict, int]:
+    """A function to tokenize watson literals with the format: &|number|"""
     token_count = 0
     token_map = {}
     while '"' in conditions:
@@ -230,13 +252,18 @@ def parse_expression(
     expression: str,
     subexpressions: Dict[str, Expression] ={},
     subexpression_count: int = 0) -> Tuple[Expression, dict, int]:
+    """A function to parse expressions from Watson to Dialogflow format"""
     
     intents = []
     events = []
 
     if len(expression) > 1:
+
+        # Add a space to help with the check
         if expression[-1] == ")":
             expression += " "
+        
+        # Count the number of close parenthesis to avoid infinite loop
         parenthesis_count = expression.count(") ")
         
         start = 0
@@ -244,11 +271,14 @@ def parse_expression(
 
         while parenthesis_count>=0:
 
+            # Check for a close parenthesis
             first_close_parenthesis = expression[start:].find(") ") + start
 
             if first_close_parenthesis == -1:
                 break
             end = min(end, first_close_parenthesis)
+
+            # Check for an open parenthesis
             closest_open_parenthesis = expression[:end].rfind("(")
             if closest_open_parenthesis == -1:
                 start = first_close_parenthesis + 1
@@ -262,15 +292,16 @@ def parse_expression(
                     parenthesis_count -= 1
                     continue
             
-            print(expression[closest_open_parenthesis+1:first_close_parenthesis])
-
+            # If we find parenthesis, then it is a subexpression, recursive call
             subexpression, subexpressions, subexpression_count = parse_expression(
                 expression[closest_open_parenthesis+1:first_close_parenthesis],
                 subexpressions=subexpressions,
                 subexpression_count=subexpression_count)
             
+
             subexpression_str = ""
 
+            # Tokenize subexpression in the format: &|(number)|&
             if subexpression.condition:
                 subexpression_key = f"&|({subexpression_count})|&"
                 subexpression_str = f" {subexpression_key} " if subexpression.condition else ""
@@ -282,14 +313,16 @@ def parse_expression(
             expression = expression[:closest_open_parenthesis] + subexpression_str + expression[first_close_parenthesis+1:]
             expression = expression.replace("    ", " ")
             
+            # Reset loop
             start = 0
             end = len(expression)
             parenthesis_count -= 1
         
         expression = expression.replace(") )", ")")
+        
+        
+        # Convert tokens into Dialogflow expression
         tokens = expression.split()
-
-
         converted_tokens = []
         empty = True
         comparison_flag = False
@@ -439,6 +472,7 @@ def parse_expression(
 
 
 def parse_conditions(conditions: str) -> Expression:
+    """Function to parse Watson condition into a Dialogflow condition"""
     
     conditions = conditions.replace("((", "( (").replace("))", ") )")
     
@@ -475,6 +509,7 @@ def parse_conditions(conditions: str) -> Expression:
 
 
 def create_node_tree(assunto: Flow) -> Tuple[Dict[str, Node], Dict[str, Node]]:
+    """Function to create a node tree from Watson Dialog Nodes"""
     start_node = Node()
 
     # All pages
@@ -555,10 +590,12 @@ def create_node_tree(assunto: Flow) -> Tuple[Dict[str, Node], Dict[str, Node]]:
 #========= Creation Functions =================================================
 def create_or_get_agent(
     create_agent: bool,
-    creds_path: str,
     requests_per_minute: dict,
     display_name: str,
+    language_code: str, 
+    time_zone: str, 
     project_id: str,
+    location: str
     ) -> types.Agent:
     agents_functions = Agents(creds_path=creds_path) # type: ignore
     agents_client = AgentsClient(credentials=agents_functions.creds)
@@ -567,30 +604,38 @@ def create_or_get_agent(
         agent = agents_client.create_agent(
             agent=types.Agent(
                 display_name=display_name,
-                default_language_code="pt-br",
-                time_zone="America/Buenos_Aires"
+                default_language_code=language_code,
+                time_zone=time_zone
             ),
-            parent=f"projects/{project_id}/locations/global"
+            parent=f"projects/{project_id}/locations/{location}"
         )
         print(agent)
+        return agent
     else:
         wait_for_time(requests_per_minute)
-        agent = agents_functions.get_agent_by_display_name(
-            project_id, display_name)
-    return agent
+        agents = list(agents_client.list_agents(parent=f"projects/{project_id}/locations/{location}"))
+        for agent in agents:
+            if agent.display_name == display_name:
+                return agent
+    
+    raise ValueError(f"Agent {display_name} not found")
+    
 
 
 def create_or_get_entity_types(
     create_entities:bool,
-    creds_path: str,
     requests_per_minute: dict,
     bot:Agent, 
-    agent: types.Agent):
+    agent: types.Agent,
+    project_id: str,
+    location: str
+    ) -> List[types.EntityType]:
     
     entity_types = []
     entity_types_names = []
     
-    entity_types_functions = EntityTypes(creds_path=creds_path)
+    # entity_types_functions = EntityTypes(creds_path=creds_path)
+    entity_type_client = EntityTypesClient()
     if create_entities:
         for assunto in bot.assuntos:
             for entity in assunto.entities:
@@ -617,31 +662,32 @@ def create_or_get_entity_types(
                 )
                 wait_for_time(requests_per_minute)
                 entity_types.append(
-                    entity_types_functions.create_entity_type(
-                        agent_id=str(agent.name),
-                        obj=entity_type)
+                    entity_type_client.create_entity_type(
+                        parent=f"projects/{project_id}/locations/{location}/agents/{str(agent.name)}",
+                        entity_type=entity_type)
                 )
                 entity_types_names.append(entity["entity"])
         print("Finished Entities")
     else:
         wait_for_time(requests_per_minute)
-        entity_types = entity_types_functions.list_entity_types(
-            agent_id=str(agent.name))
+        entity_types = list(entity_type_client.list_entity_types(
+            parent=f"projects/{project_id}/locations/global/agents/{str(agent.name)}"))
     
     return entity_types
 
 
 def create_or_get_intents(
     create_intents: bool,
-    creds_path: str,
     requests_per_minute: dict,
     bot: Agent,
     agent: types.Agent,
     entity_types: List[types.EntityType],
-    add_description_as_training_phrase: bool
+    add_description_as_training_phrase: bool, 
+    project_id: str,
+    location: str
     ):
     intents = []
-    intents_functions = Intents(creds_path=creds_path)
+    intents_client = IntentsClient()
     if create_intents:
         for assunto in bot.assuntos:
             for intent in assunto.intents:
@@ -725,34 +771,31 @@ def create_or_get_intents(
                 )
                 wait_for_time(requests_per_minute)
                 intents.append(
-                    intents_functions.create_intent(
-                        agent_id=str(agent.name),
-                        obj=intent_obj)
+                    intents_client.create_intent(
+                        parent=f"projects/{project_id}/locations/{location}/agents/{str(agent.name)}",
+                        intent=intent_obj)
                 )
 
         print("Finished Intents")
     else:
-        intents = intents_functions.list_intents(
-            str(agent.name), language_code="pt-br")
+        intents = list(intents_client.list_intents(
+            parent=f"projects/{project_id}/locations/{location}/agents/{str(agent.name)}"))
     
     return intents
 
 
 def create_or_get_flows(
     create_flows:bool,
-    creds_path:str,
     requests_per_minute: dict,
     bot: Agent,
     agent: types.Agent,
-    intents: List[types.Intent],
-    intents_as_routes: bool,
-    parentless_folders_as_flows: bool
+    parentless_folders_as_flows: bool,
+    project_id: str,
+    location: str
     ) -> Dict[str, types.Flow]:
     flows = {}
-    flows_functions = Flows(creds_path=creds_path)
+    flows_client = FlowsClient()
     if create_flows:
-        flows_client = FlowsClient(
-            credentials=flows_functions.creds)
         if not parentless_folders_as_flows:
             for assunto in bot.assuntos:
                 flow_obj = types.Flow(
@@ -782,7 +825,7 @@ def create_or_get_flows(
                     parent=str(agent.name),flow=flow_obj)
     else:
         wait_for_time(requests_per_minute)
-        flows_list = flows_functions.list_flows(str(agent.name))
+        flows_list = list(flows_client.list_flows(parent=f"projects/{project_id}/locations/{location}/agents/{str(agent.name)}"))
         if parentless_folders_as_flows:
             assunto = bot.assuntos[0]
             for page in assunto.pages:
@@ -795,34 +838,6 @@ def create_or_get_flows(
         else:
             flows = {str(flow.display_name): flow for flow in flows_list}
 
-    
-    if intents_as_routes:
-        wait_for_time(requests_per_minute)
-        start_flow_obj = flows_functions.get_flow(str(agent.start_flow))
-        transition_routes = start_flow_obj.transition_routes
-        for intent in intents:
-            if "00000000-0000-0000-0000-000000000001" in str(intent.name):
-                continue
-            transition_route = types.TransitionRoute(
-                    intent=intent.name,
-                    trigger_fulfillment=types.Fulfillment(
-                        messages=[
-                            types.ResponseMessage(
-                                text=types.ResponseMessage.Text(
-                                    text=[intent.display_name]
-                                )
-                            )
-                        ]
-                    )
-                )
-            transition_routes.append(transition_route) # type: ignore
-        start_flow_obj.transition_routes = transition_routes
-        wait_for_time(requests_per_minute)
-        start_flow_obj = flows_functions.update_flow(
-                    flow_id=str(start_flow_obj.name),
-                    obj=start_flow_obj
-                )
-
     return flows
 
 
@@ -832,10 +847,13 @@ def create_child_page(
     intents,
     flow_name: str,
     flow_id: str,
-    flows_functions: Flows,
-    pages_functions: Pages,
+    flows_client: FlowsClient,
+    pages_client: PagesClient,
     requests_per_minute: dict,
-    parent: Union[types.Flow, types.Page]):
+    parent: Union[types.Flow, types.Page], 
+    agent: types.Agent,
+    project_id: str, 
+    location: str):
     
     page_dict = page.page
     if page_dict.get("type", "standard") not in [
@@ -893,9 +911,9 @@ def create_child_page(
         wait_for_time(requests_per_minute)
         try:
             pages[flow_name][
-                "pages"][dialog_node_id] = pages_functions.create_page(
-                flow_id,
-                child_page)
+                "pages"][dialog_node_id] = pages_client.create_page(
+                parent=f"projects/{project_id}/locations/{location}/agents/{str(agent.name)}/flows/{flow_id}",
+                page=child_page)
             page_target = True
         except FailedPrecondition as e:
             print(e)
@@ -907,18 +925,23 @@ def create_child_page(
                     display_name = dialog_node_id
                 )
                 pages[flow_name][
-                    "pages"][dialog_node_id] = pages_functions.create_page(
-                    flow_id,
-                    child_page)
+                    "pages"][dialog_node_id] = pages_client.create_page(
+                parent=f"projects/{project_id}/locations/{location}/agents/{str(agent.name)}/flows/{flow_id}",
+                page=child_page)
                 page_target = True
             except AlreadyExists as e:
                 print(e)
                 wait_for_time(requests_per_minute)
-                pages_map = pages_functions.get_pages_map(flow_id, reverse=True)
+                pages_map = {
+                    page.display_name: page
+                    for page in pages_client.list_pages(
+                        parent=f"projects/{project_id}/locations/{location}/agents/{str(agent.name)}/flows/{flow_id}")
+                }
+
                 page_id = str(pages_map.get(dialog_node_id, pages_map.get(page.page.get("title", ""))))
                 wait_for_time(requests_per_minute)
                 pages[flow_name][
-                    "pages"][dialog_node_id] = pages_functions.get_page(page_id)
+                    "pages"][dialog_node_id] = pages_map.get(page_id, None)
     
     if expression.condition or expression.intents or expression.events:
         intent_ids = []
@@ -975,15 +998,18 @@ def create_child_page(
 
     for child in page.children:
         create_child_page(
-            child,
-            pages,
-            intents,
-            flow_name,
-            flow_id,
-            flows_functions,
-            pages_functions,
-            requests_per_minute,
-            pages[flow_name]["pages"][dialog_node_id])
+            page=child,
+            pages=pages,
+            intents=intents,
+            flow_name=flow_name,
+            flow_id=flow_id,
+            flows_client=flows_client,
+            pages_client=pages_client,
+            requests_per_minute=requests_per_minute,
+            parent=pages[flow_name]["pages"][dialog_node_id],
+            agent=agent,
+            project_id=project_id,
+            location=location)
 
 
 def create_jump_to_routes(
@@ -992,7 +1018,7 @@ def create_jump_to_routes(
     pages: Dict[str, dict],
     flows: Dict[str, types.Flow],
     requests_per_minute: dict,
-    pages_functions: Pages):
+    pages_client: PagesClient):
 
     if not page.flow_id:
         print("no flow id")
@@ -1062,8 +1088,8 @@ def create_jump_to_routes(
     )
     pages[page.flow_id]["pages"][name].transition_routes.append(transition_route) # type: ignore
     wait_for_time(requests_per_minute)
-    pages[page.flow_id]["pages"][name] = pages_functions.update_page(
-        str(pages[page.flow_id]["pages"][name].name), pages[page.flow_id]["pages"][name])
+    pages[page.flow_id]["pages"][name] = pages_client.update_page(
+        pages[page.flow_id]["pages"][name])
 
 
 def create_pages_folders_as_flows(
@@ -1072,45 +1098,61 @@ def create_pages_folders_as_flows(
     flows: Dict[str, types.Flow],
     pages: Dict[str, dict],
     intents: List[types.Intent],
-    flows_functions: Flows,
-    pages_functions: Pages,
-    requests_per_minute: dict
+    flows_client: FlowsClient,
+    pages_client: PagesClient,
+    requests_per_minute: dict, 
+    project_id: str, 
+    location: str
     ) -> Dict[str, dict]:
     
     page_nodes, trees = create_node_tree(bot.assuntos[0])
     # Create intent and condition routes
     for name, tree in trees.items():
+        flow = ""
         # Start flow
         if name == "start":
             print("start")
             wait_for_time(requests_per_minute)
-            start_flow = flows_functions.get_flow(str(agent.start_flow))
+            flow = flows_client.get_flow(name=str(agent.start_flow))
+        elif name in flows:
+            flow = flows[name]
+        
+        if flow:
             for child in tree.children:
                 print("start_child")
-                create_child_page(child, pages, intents, name, str(start_flow.name), flows_functions, pages_functions, requests_per_minute, start_flow)
-
-        # Creation for other  flows
-        elif name in flows:
-            wait_for_time(requests_per_minute)
-            flow = flows[name]
-            for child in tree.children:
-                create_child_page(child, pages, intents, name, str(flow.name), flows_functions, pages_functions, requests_per_minute, flow)
+                create_child_page(
+                    page=child,
+                    pages=pages,
+                    intents=intents,
+                    flow_name=name,
+                    flow_id=str(flow.name),
+                    flows_client=flows_client,
+                    pages_client=pages_client,
+                    requests_per_minute=requests_per_minute,
+                    parent=flow,
+                    agent=agent,
+                    project_id=project_id,
+                    location=location)
     
     # Create jump_to routes:
     for name, page in page_nodes.items():
-        create_jump_to_routes(name, page, pages, flows, requests_per_minute, pages_functions)
+        create_jump_to_routes(name=name, page=page, pages=pages, flows=flows, requests_per_minute=requests_per_minute, pages_client=pages_client)
     
     return pages
 
 
 def create_pages_multiflow(
-    bot,
-    flows,
-    pages,
-    intents,
-    requests_per_minute,
-    pages_functions,
-    flows_functions) -> Dict[str, dict]:
+    bot: Agent,
+    agent: types.Agent,
+    flows: Dict[str, types.Flow],
+    pages: Dict[str, dict],
+    intents: List[types.Intent],
+    flows_client: FlowsClient,
+    pages_client: PagesClient,
+    requests_per_minute: dict, 
+    project_id: str, 
+    location: str
+    ) -> Dict[str, dict]:
     for assunto in bot.assuntos:
         is_parent_pages = {page["dialog_node"]: False for page in assunto.pages}
         for page in assunto.pages:
@@ -1121,7 +1163,6 @@ def create_pages_multiflow(
         
         flow_id = ""
         flow_obj = types.Flow()
-        flow_idx = 0
         flow_display_name = assunto.workspace["name"]
 
     
@@ -1191,9 +1232,9 @@ def create_pages_multiflow(
                     event_handlers=[]
                 )
                 wait_for_time(requests_per_minute)
-                page_response = pages_functions.create_page(
-                        flow_id=flow_id,
-                        obj=page_obj
+                page_response = pages_client.create_page(
+                        parent=f"projects/{project_id}/locations/{location}/agents/{str(agent.name)}/flows/{flow_id}",
+                        page=page_obj
                     )
                 target_page = page_response.name
                 pages[flow_display_name]["pages"].append(page_response)
@@ -1223,7 +1264,7 @@ def create_pages_multiflow(
                     p_page_obj.transition_routes.extend(routes)
                     wait_for_time(requests_per_minute)
                     try:
-                        pages_functions.update_page(str(p_page_obj.name), p_page_obj)
+                        pages_client.update_page(page=p_page_obj)
                     except InvalidArgument as e:
                         print(e)
                 else:
@@ -1232,8 +1273,7 @@ def create_pages_multiflow(
                     flow_obj.transition_routes.extend(routes) # type: ignore
                     
                     try:
-                        flows_functions.update_flow(str(flow_obj.name), flow_obj)
-                        flows[flow_idx] = flow_obj
+                        flows_client.update_flow(flow=flow_obj)
                     except InvalidArgument as e:
                         print(e)
                         flow_obj.transition_routes = backup_routes # type: ignore
@@ -1245,13 +1285,14 @@ def create_pages_multiflow(
 
 def create_or_get_pages(
     create_pages:bool,
-    creds_path: str,
     requests_per_minute: dict,
     bot: Agent,
     agent: types.Agent,
     flows: Dict[str, types.Flow],
     intents: List[types.Intent],
-    parentless_folders_as_flows
+    parentless_folders_as_flows: bool, 
+    project_id: str, 
+    location: str
     ) -> Dict[str, dict]:
     """
     dialog_node - supported, used as display name
@@ -1283,19 +1324,40 @@ def create_or_get_pages(
     """
     
     pages: Dict[str, dict] = {}
-    pages_functions = Pages(creds_path=creds_path)
-    flows_functions = Flows(creds_path=creds_path)
+    pages_client = PagesClient()
+    flows_client = FlowsClient()
 
     if create_pages:
         if parentless_folders_as_flows:
-            return create_pages_folders_as_flows(bot, agent, flows, pages, intents, flows_functions, pages_functions, requests_per_minute)
+            return create_pages_folders_as_flows(
+                bot=bot,
+                agent=agent,
+                flows=flows,
+                pages=pages, 
+                intents=intents,
+                flows_client=flows_client,
+                pages_client=pages_client,
+                requests_per_minute=requests_per_minute, 
+                project_id=project_id,
+                location=location)
         else:
-            return create_pages_multiflow(bot, flows, pages, intents, requests_per_minute, pages_functions, flows_functions)
+            return create_pages_multiflow(
+                bot=bot,
+                agent=agent,
+                flows=flows,
+                pages=pages, 
+                intents=intents,
+                flows_client=flows_client,
+                pages_client=pages_client,
+                requests_per_minute=requests_per_minute, 
+                project_id=project_id,
+                location=location)
 
     else:
         for flow in flows:
             wait_for_time(requests_per_minute)
-            pages[str(flows[flow].name)]["pages"] = pages_functions.list_pages(flow_id=str(flows[flow].name))
+            pages[str(flows[flow].name)]["pages"] = pages_client.list_pages(
+                parent=f"projects/{project_id}/locations/{location}/agents/{str(agent.name)}/flows/{str(flows[flow].name)}")
 
     
     return pages
@@ -1305,17 +1367,17 @@ def create_or_get_pages(
 
 def main(
     input_paths: str,
-    output_path: str,
     display_name: str,
+    language_code: str,
+    time_zone: str,
+    location:str,
     project_id: str,
-    creds_path: str,
     create_agent: bool = True,
     create_entities:  bool = True,
     create_intents: bool = True,
     add_description_as_training_phrase: bool = True,
     create_flows: bool = True,
     create_pages: bool = True,
-    intents_as_routes: bool = False,
     parentless_folders_as_flows = False
     ) -> None:
     """Main function"""
@@ -1333,62 +1395,61 @@ def main(
             assuntos.append(Flow(json.loads(f.read())))
     
     bot = Agent(assuntos)
-    agent = types.Agent(
-        display_name=display_name,
-        default_language_code="pt-br",
-        time_zone="America/Buenos_Aires"
-    )
     # Create Agent
     agent = create_or_get_agent(
-        create_agent,
-        creds_path,
-        requests_per_minute,
-        display_name,
-        project_id,
+        create_agent=create_agent,
+        requests_per_minute=requests_per_minute,
+        display_name=display_name,
+        language_code=language_code,
+        time_zone=time_zone,
+        project_id=project_id,
+        location=location
         )
     
     # Create Entity Types
     entity_types = create_or_get_entity_types(
-        create_entities,
-        creds_path,
-        requests_per_minute,
-        bot, 
-        agent
+        create_entities=create_entities,
+        requests_per_minute=requests_per_minute,
+        bot=bot, 
+        agent=agent,
+        project_id=project_id,
+        location=location
         )
     
     # Create Intents
     intents = create_or_get_intents(
-        create_intents,
-        creds_path,
-        requests_per_minute,
-        bot,
-        agent,
-        entity_types,
-        add_description_as_training_phrase
+        create_intents=create_intents,
+        requests_per_minute=requests_per_minute,
+        bot=bot,
+        agent=agent,
+        entity_types=entity_types,
+        add_description_as_training_phrase=add_description_as_training_phrase, 
+        project_id=project_id,
+        location=location
         )
 
     # Create Flows
     flows = create_or_get_flows(
-        create_flows,
-        creds_path,
-        requests_per_minute,
-        bot,
-        agent,
-        intents,
-        intents_as_routes,
-        parentless_folders_as_flows
+        create_flows=create_flows,
+        requests_per_minute=requests_per_minute,
+        bot=bot,
+        agent=agent,
+        parentless_folders_as_flows=parentless_folders_as_flows, 
+        project_id=project_id,
+        location=location
         )
     
     # Create Pages
     create_or_get_pages(
-        create_pages,
-        creds_path,
-        requests_per_minute,
-        bot,
-        agent,
-        flows,
-        intents,
-        parentless_folders_as_flows
+        create_pages=create_pages,
+        requests_per_minute=requests_per_minute,
+        bot=bot,
+        agent=agent,
+        flows=flows,
+        intents=intents,
+        parentless_folders_as_flows=parentless_folders_as_flows, 
+        project_id=project_id,
+        location=location
         )
 
 
@@ -1401,72 +1462,80 @@ if __name__ == "__main__":
         default="watson.json",
         help="Input json to process.",
     )
+
     parser.add_argument(
-        "--output",
-        dest="output",
-        default="dialogflow.json",
-        help="Output json.",
-    )
-    parser.add_argument(
-        "--bot_name",
+        "--bot_display_name",
         dest="bot_name",
         default="Converted_Bot",
         help="Display name of the bot.",
     )
+
     parser.add_argument(
-        "--project_id",
-        dest="project_id",
-        default="egon-ongcp-demos",
-        help="Project ID.",
-    )
-    parser.add_argument(
-        "--creds_path",
-        dest="creds_path",
-        default="credentials.json",
-        help="Credentials Path.",
-    )
-    parser.add_argument(
-        "--skip_agent",
-        dest="create_agent",
-        default=True,
-        action="store_false",
-        help="Create Agent.",
-    )
-    parser.add_argument(
-        "--skip_intents",
-        dest="create_intents",
-        default=True,
-        action="store_false",
-        help="Create Intents.",
-    )
-    parser.add_argument(
-        "--skip_entities",
-        dest="create_entities",
-        default=True,
-        action="store_false",
-        help="Create Entities.",
-    )
-    parser.add_argument(
-        "--skip_flows",
-        dest="create_flows",
-        default=True,
-        action="store_false",
-        help="Create Flows.",
-    )
-    parser.add_argument(
-        "--skip_pages",
-        dest="create_pages",
-        default=True,
-        action="store_false",
-        help="Create Pages.",
+        "--bot_language_code",
+        dest="bot_language_code",
+        default="pt-br",
+        help="Language of the bot.",
     )
 
     parser.add_argument(
-        "--intent_as_routes",
-        dest="intents_as_routes",
-        default=False,
-        action="store_true",
-        help="Create Pages.",
+        "--bot_time_zone",
+        dest="bot_time_zone",
+        default="America/Buenos_Aires",
+        help="Time zone of the bot.",
+    )
+
+    parser.add_argument(
+        "--bot_location",
+        dest="bot_location",
+        default="global",
+        help="Location of the bot.",
+    )
+
+    parser.add_argument(
+        "--project_id",
+        dest="project_id",
+        default="project_id",
+        help="Google Cloud Project ID.",
+    )
+
+    parser.add_argument(
+        "--skip_agent_creation",
+        dest="create_agent",
+        default=True,
+        action="store_false",
+        help="Flag to skip agent creation. The script will just get the existing agent.",
+    )
+
+    parser.add_argument(
+        "--skip_intents_creation",
+        dest="create_intents",
+        default=True,
+        action="store_false",
+        help="Flag to skip intent creation. The script will just get the existing intents.",
+    )
+
+    parser.add_argument(
+        "--skip_entities_creation",
+        dest="create_entities",
+        default=True,
+        action="store_false",
+        help="Flag to skip entities creation. The script will just get the existing entities.",
+    )
+
+    parser.add_argument(
+        "--skip_flows_creation",
+        dest="create_flows",
+        default=True,
+        action="store_false",
+        help="Flag to skip flow creation. The script will just get the existing flows.",
+    )
+
+    parser.add_argument(
+        "--skip_pages_creation",
+        dest="create_pages",
+        default=True,
+        action="store_false",
+        help="Flag to skip page creation.",
     )
 
     parser.add_argument(
@@ -1474,21 +1543,21 @@ if __name__ == "__main__":
         dest="parentless_folders_as_flows",
         default=False,
         action="store_true",
-        help="Create Pages.",
+        help="Flag to use parentless folders as flows inside Dialogflow CX.",
     )
     
-    
     args = parser.parse_args()
+
     main(
-        args.input,
-        args.output, 
-        args.bot_name,
-        args.project_id,
-        args.creds_path,
+        input_paths=args.input,
+        display_name=args.bot_name,
+        language_code=args.bot_language_code,
+        time_zone=args.bot_time_zone,
+        location=args.bot_location,
+        project_id=args.project_id,
         create_agent=args.create_agent,
         create_intents=args.create_intents,
         create_entities=args.create_entities,
         create_flows=args.create_flows,
         create_pages=args.create_pages,
-        intents_as_routes=args.intents_as_routes,
         parentless_folders_as_flows=args.parentless_folders_as_flows)
