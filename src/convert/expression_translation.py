@@ -17,11 +17,11 @@ def is_number(s: str) -> bool:
     except ValueError:
         return False
 
-def parse_expression(
+def translate_expression(
     expression: str,
     subexpressions: Dict[str, Expression] ={},
     subexpression_count: int = 0) -> Tuple[Expression, dict, int]:
-    """A function to parse expressions from Watson to Dialogflow format"""
+    """A function to translate expressions from Watson to Dialogflow format"""
     
     intents = []
     events = []
@@ -62,7 +62,7 @@ def parse_expression(
                     continue
             
             # If we find parenthesis, then it is a subexpression, recursive call
-            subexpression, subexpressions, subexpression_count = parse_expression(
+            subexpression, subexpressions, subexpression_count = translate_expression(
                 expression[closest_open_parenthesis+1:first_close_parenthesis],
                 subexpressions=subexpressions,
                 subexpression_count=subexpression_count)
@@ -184,7 +184,7 @@ def parse_expression(
                 converted_tokens.append(token)
                 empty = False
             else:
-                token_type, converted = parse_condition_tokens(token)
+                token_type, converted = translate_condition_tokens(token)
                 if token_type in ["no_match", "start"]:
                     if operation:
                         operation = ""
@@ -240,15 +240,60 @@ def parse_expression(
     return expression_obj, subexpressions, subexpression_count
 
 
-def parse_conditions(conditions: str) -> Expression:
-    """Function to parse Watson condition into a Dialogflow condition"""
+def translate_ternary(expression: str) -> str:
+        if "?" in expression:
+            interrogation_idx = expression.find("?")
+            colon_idx = expression.find(":")
+            if (not (interrogation_idx and colon_idx)) or (
+                interrogation_idx > colon_idx):
+                return translate_conditions(expression).condition
+            if interrogation_idx > colon_idx:
+                return translate_conditions(expression).condition
+            condition = expression[:interrogation_idx]
+            true_result = translate_ternary(
+                expression=expression[interrogation_idx+1:colon_idx])
+            false_result = translate_ternary(
+                expression=expression[colon_idx+1:])
+            condition = translate_conditions(condition).condition.strip()
+            context = (
+                f"$sys.func.IF(\"{condition}\", {true_result.strip()},"
+                f" {false_result.strip()})")
+        else:
+            context = translate_conditions(expression).condition
+        
+        return context
+
+
+def translate_context(context: str) -> str:
+    if not "<?" in context or not "?>" in context:
+        return context
+    
+    
+    context = context[context.find("<?")+2:context.find("?>")]
+    context, token_map, token_count = tokenize_literals(context)
+
+    context = translate_ternary(context)
+    
+    
+    # [TODO] Check for functions in the result
+
+
+    if token_count:
+        for k, v in token_map.items():
+            context = context.replace(k,v)
+
+    return context
+
+
+def translate_conditions(conditions: str) -> Expression:
+    """Function to translate Watson condition into a Dialogflow condition"""
     
     conditions = conditions.replace("((", "( (").replace("))", ") )")
     
     # Tokenize Literals
     conditions, token_map, token_count = tokenize_literals(conditions)
 
-    expression, subexpressions, _ = parse_expression(conditions, {}, 0)
+    expression, subexpressions, _ = translate_expression(conditions, {}, 0)
 
     condition = expression.condition
     
@@ -286,9 +331,9 @@ def parse_conditions(conditions: str) -> Expression:
     return expression
 
 
-def parse_condition_tokens(token: str):
+def translate_condition_tokens(token: str):
     """
-    A help function to parse condition tokens
+    A help function to translate condition tokens
     # - intents
     @ - entities
     @{entity-name}:{value} - Value of entity
@@ -322,22 +367,22 @@ def parse_condition_tokens(token: str):
                 converted_list = []
 
                 for item in item_list:
-                    converted_token = parse_condition_tokens(item)[1]
+                    converted_token = translate_condition_tokens(item)[1]
 
                     # Probably a bug, we need to use TO_TEXT when the string has
                     # a space char
                     converted_item = f'$sys.func.TO_TEXT({converted_token})'
                     converted_list.append(converted_item)
                 
-                _, converted_contain = parse_condition_tokens(tokens[1])
+                _, converted_contain = translate_condition_tokens(tokens[1])
                 converted = (
                     f"$sys.func.CONTAIN([{','.join(converted_list)}], "
                     f"{converted_contain})")
             else:
                 tokens: List[str] = token[:-1].split(".contains(")
                 if tokens != None and len(tokens) == 2:
-                    _, token_string = parse_condition_tokens(tokens[0]) # type: ignore 
-                    _, token_substring = parse_condition_tokens(tokens[1]) # type: ignore 
+                    _, token_string = translate_condition_tokens(tokens[0]) # type: ignore 
+                    _, token_substring = translate_condition_tokens(tokens[1]) # type: ignore 
                     token_type = "contains"
                     converted = f"{token_string} : {token_substring}"
         
@@ -353,7 +398,7 @@ def parse_condition_tokens(token: str):
         
         elif token[0] == "!":
             token_type = "negation"
-            token_type, converted = parse_condition_tokens(token[1:])
+            token_type, converted = translate_condition_tokens(token[1:])
             converted = f"NOT {converted}"
 
         elif token[0] == "[":
@@ -381,6 +426,7 @@ def parse_condition_tokens(token: str):
         elif token.startswith("now()"):
             token_type = "checkTime"
             operation = ""
+            converted = ""
             time = token.split("(")[-1][:-1]
             if "sameOrAfter" in token:
                 operation = ">="
@@ -390,8 +436,10 @@ def parse_condition_tokens(token: str):
                 operation = "<="
             elif "before" in token:
                 operation = "<"
-            # converted = f"$sys.func.NOW() {operation} {time}"
-            converted = "0"
+            else:
+                converted = "$sys.func.NOW()"
+                token_type = "now"
+            
         
         elif token.lower() == "true":
             token_type = "true"
@@ -414,33 +462,33 @@ def parse_condition_tokens(token: str):
     return token_type, converted
 
 
-def tokenize_literals(conditions: str) -> Tuple[str, dict, int]:
+def tokenize_literals(expression: str) -> Tuple[str, dict, int]:
     """A function to tokenize watson literals with the format: &|number|"""
     token_count = 0
     token_map = {}
-    while '"' in conditions:
-        first = conditions.find('"')
-        second = conditions[first + 1:].find('"') + first + 1
+    while '"' in expression:
+        first = expression.find('"')
+        second = expression[first + 1:].find('"') + first + 1
         token_key = f"&|{token_count}"
         token_count += 1
-        token_map[token_key] = conditions[first:second + 1].replace('"', "'")
-        conditions = conditions[:first] + token_key + conditions[second+1:]
+        token_map[token_key] = expression[first:second + 1].replace('"', "'")
+        expression = expression[:first] + token_key + expression[second+1:]
     
-    while "'" in conditions:
-        first = conditions.find("'")
-        second = conditions[first + 1:].find("'") + first + 1
+    while "'" in expression:
+        first = expression.find("'")
+        second = expression[first + 1:].find("'") + first + 1
         token_key = f"&|{token_count}"
         token_count += 1
-        token_map[token_key] = conditions[first:second + 1]
-        conditions = conditions[:first] + token_key + conditions[second+1:]
+        token_map[token_key] = expression[first:second + 1]
+        expression = expression[:first] + token_key + expression[second+1:]
     
-    while ':(' in conditions:
-        first = conditions.find(':(')
-        second = conditions[first + 1:].find(')') + first + 1
+    while ':(' in expression:
+        first = expression.find(':(')
+        second = expression[first + 1:].find(')') + first + 1
         token_key = f"&|{token_count}"
         token_count += 1
-        token_map[token_key] = conditions[first+2:second]
-        conditions = conditions[:first+1] + token_key + conditions[second+1:]
+        token_map[token_key] = expression[first+2:second]
+        expression = expression[:first+1] + token_key + expression[second+1:]
 
-    return conditions, token_map, token_count
+    return expression, token_map, token_count
 

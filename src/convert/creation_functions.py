@@ -1,7 +1,7 @@
 import time
 from typing import List, Dict, Union
 
-from src.convert.expression_parser import parse_conditions
+from src.convert.expression_translation import translate_conditions, translate_context
 from src.convert.tree_creator import create_node_tree
 from src.convert.custom_types import Node, Agent
 
@@ -307,7 +307,7 @@ def create_child_page(
         print("no condition")
         return
 
-    expression = parse_conditions(page_dict["conditions"])
+    expression = translate_conditions(page_dict["conditions"])
     
     messages = [
         types.ResponseMessage(
@@ -320,10 +320,11 @@ def create_child_page(
     parameter_actions = []
 
     for k, v in page_dict.get("context", {}).items():
-        parameter_actions = [
+        v = translate_context(str(v))
+        parameter_actions.append(
             types.Fulfillment.SetParameterAction(
                 parameter=k,
-                value=v)]
+                value=v))
 
     fullfillment = types.Fulfillment(
         messages=messages,
@@ -458,7 +459,8 @@ def create_jump_to_routes(
     pages: Dict[str, dict],
     flows: Dict[str, types.Flow],
     requests_per_minute: dict,
-    pages_client: PagesClient):
+    pages_client: PagesClient,
+    flows_client: FlowsClient):
 
     if not page.flow_id:
         print("no flow id")
@@ -489,39 +491,57 @@ def create_jump_to_routes(
     
     page_id = ""
     flow_id = ""
+    target_page = None
+    other_flow = False
 
-    if dialog_node_id == page.flow_id:
+    if dialog_node_id in flows:
         flow_id = str(flows[dialog_node_id].name)
     else:
-        page_id = str(pages[page.flow_id]["pages"].get(dialog_node_id, ""))
-        if not page_id:
+        for key in pages:
+            target_page = pages[key]["pages"].get(dialog_node_id, None)
+            if target_page:
+                page_id = target_page.name
+                if key != page.flow_id:
+                    other_flow = True
+                    flow_id = key
+                break
+        if not page_id:   
             print("target page id not found")
             return
+
+    parameter_actions = [] 
+    messages =[] 
+    
+    if target_page:
+        messages = [
+            types.ResponseMessage(
+                text=types.ResponseMessage.Text(text=[value])
+                ) for value in page_dict.get(
+                    "output",{"text":{"values":[]}})
+                    .get("text", {"values":[]})
+                    .get("values",[])]
         
 
-
-    messages = [
-        types.ResponseMessage(
-            text=types.ResponseMessage.Text(text=[value])
-            ) for value in page_dict.get(
-                "output",{"text":{"values":[]}})
-                .get("text", {"values":[]})
-                .get("values",[])]
+        for k, v in page_dict.get("context", {}).items():
+            
+            v = translate_context(str(v))
+            parameter_actions.append(
+                types.Fulfillment.SetParameterAction(
+                    parameter=k,
+                    value=v))
     
-    parameter_actions = []
-
-    for k, v in page_dict.get("context", {}).items():
-        parameter_actions = [
+    if other_flow:
+        parameter_actions.append(
             types.Fulfillment.SetParameterAction(
-                parameter=k,
-                value=v)]
+                parameter="target_page",
+                value=page_id))
 
     fullfillment = types.Fulfillment(
-        messages=messages,
+        messages=messages if messages else None,
         set_parameter_actions=parameter_actions)
 
     transition_route = types.TransitionRoute(
-        target_page=page_id if page_id else None,
+        target_page=page_id if page_id and not other_flow else None,
         target_flow=flow_id if flow_id else None,
         trigger_fulfillment=fullfillment,
         condition="true"
@@ -530,6 +550,16 @@ def create_jump_to_routes(
     wait_for_time(requests_per_minute)
     pages[page.flow_id]["pages"][name] = pages_client.update_page(
         page=pages[page.flow_id]["pages"][name])
+    
+    if other_flow:
+        transition_route = types.TransitionRoute(
+            target_page=page_id,
+            condition=f"$session.param.target_page={page_id}"
+        )
+        flow = flows[flow_id]
+        flow.transition_routes.append(transition_route)
+        flows[flow_id] = flows_client.update_flow(flow=flow)
+
 
 
 def create_pages_folders_as_flows(
@@ -570,7 +600,14 @@ def create_pages_folders_as_flows(
     
     # Create jump_to routes:
     for name, page in page_nodes.items():
-        create_jump_to_routes(name=name, page=page, pages=pages, flows=flows, requests_per_minute=requests_per_minute, pages_client=pages_client)
+        create_jump_to_routes(
+            name=name,
+            page=page,
+            pages=pages,
+            flows=flows,
+            requests_per_minute=requests_per_minute,
+            pages_client=pages_client,
+            flows_client=flows_client)
     
     return pages
 
@@ -630,7 +667,8 @@ def create_pages_multiflow(
             parameter_actions = []
 
             for k, v in page.get("context", {}).items():
-                parameter_actions = [types.Fulfillment.SetParameterAction(parameter=k, value=v)]
+                v = translate_context(str(v))
+                parameter_actions.append(types.Fulfillment.SetParameterAction(parameter=k, value=v))
 
             fullfillment = types.Fulfillment(messages=messages, set_parameter_actions=parameter_actions)
 
@@ -640,7 +678,7 @@ def create_pages_multiflow(
             conditions = page.get("conditions","")
             if conditions == "":
                 continue
-            expression = parse_conditions(conditions)
+            expression = translate_conditions(conditions)
             if not (expression.condition or expression.intents):
                 continue
             
@@ -726,11 +764,11 @@ def create_or_get_pages(
     ) -> Dict[str, dict]:
     """
     dialog_node - supported, used as display name
-    conditions - partially supported, it does not work with functions
+    conditions - partially supported, it does not work with time functions
     parent - supported as route using conditions
     previous_sibling - not supported
     output - supported for text values
-    context - partially supported, it does not work with functions
+    context - partially supported, it does not work with time functions
     metadata - maybe
     next_step - maybe
     title - maybe
