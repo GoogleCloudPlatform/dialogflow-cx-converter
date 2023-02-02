@@ -239,29 +239,73 @@ def translate_expression(
 
     return expression_obj, subexpressions, subexpression_count
 
+def ternary_walker(expression: str, last_type: str) -> list:
+    return_sequence = []
+    interrogation_idx = expression.find("?")
+    colon_idx = expression.find(":")
+    if interrogation_idx > 0 and interrogation_idx < colon_idx:
+            path_type = "condition"
+            condition, rest = expression.split("?", maxsplit=1)
+            condition = translate_conditions(condition).condition.strip()
+            return_sequence.append({"type": path_type, "value": condition})
+            return_sequence += ternary_walker(
+                rest, last_type=path_type)
+    else:
+        if expression.count(":") == 1:
+            true, false = expression.split(":", maxsplit=1)
+            true = translate_conditions(true).condition
+            false = translate_conditions(false).condition
+            return_sequence.append({"type": "true", "value": true})
+            return_sequence.append({"type": "false", "value": false})
+
+
+        else:
+            if last_type in ["true", "false"]:
+                path_type = "false"
+            else:
+                path_type = "true"
+            statement, rest = expression.split(":",maxsplit=1)
+            statement = translate_conditions(statement).condition
+            return_sequence.append({"type": path_type, "value": statement})
+            return_sequence += ternary_walker(rest, path_type)
+
+    print(expression)
+    print(return_sequence)
+    return return_sequence
+
 
 def translate_ternary(expression: str) -> str:
-        if "?" in expression:
-            interrogation_idx = expression.find("?")
-            colon_idx = expression.find(":")
-            if (not (interrogation_idx and colon_idx)) or (
-                interrogation_idx > colon_idx):
-                return translate_conditions(expression).condition
-            if interrogation_idx > colon_idx:
-                return translate_conditions(expression).condition
-            condition = expression[:interrogation_idx]
-            true_result = translate_ternary(
-                expression=expression[interrogation_idx+1:colon_idx])
-            false_result = translate_ternary(
-                expression=expression[colon_idx+1:])
-            condition = translate_conditions(condition).condition.strip()
-            context = (
-                f"$sys.func.IF(\"{condition}\", {true_result.strip()},"
-                f" {false_result.strip()})")
-        else:
-            context = translate_conditions(expression).condition
+    def subcondition(sequence: List[dict], idx: int) -> Tuple[str, int]:
+        condition = ""
+        true = ""
+        false = ""
+        if len(sequence) - 1 < idx + 2:
+            return sequence[idx]["value"], idx
+        if sequence[idx]["type"] == "condition":
+            condition = sequence[idx]["value"]
+            if sequence[idx+1]["type"] == "true":
+                true = sequence[idx+1]["value"]
+                if sequence[idx+2]["type"] == "false":
+                    false = sequence[idx+2]["value"]
+                    idx += 2
+                else:
+                    false, idx = subcondition(sequence=sequence, idx=idx+2)
+            else:
+                true, idx = subcondition(sequence=sequence, idx=idx+1)
+                false, idx = subcondition(sequence=sequence, idx=idx+1)
+
         
-        return context
+        return f'$sys.func.IF("{condition}","{true}","{false}")', idx
+
+
+    sequence = ternary_walker(expression=expression, last_type="")
+    print(sequence)
+
+    parameter, _ = subcondition(sequence=sequence, idx=0)
+    
+    return parameter
+
+
 
 
 def translate_context(context: str) -> str:
@@ -271,8 +315,10 @@ def translate_context(context: str) -> str:
     
     context = context[context.find("<?")+2:context.find("?>")]
     context, token_map, token_count = tokenize_literals(context)
-
-    context = translate_ternary(context)
+    if "?" in context:
+        context = translate_ternary(context)
+    else:
+        context = translate_conditions(context).condition
     
     
     # [TODO] Check for functions in the result

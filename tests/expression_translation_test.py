@@ -50,7 +50,24 @@ def test_context_with_function_and_parenthesis():
         '$sys.func.IF("( $session.params.testData != null'
         ' AND $session.params.testData.test != null ) OR'
         ' ( $session.params.test != null AND '
-        '$session.params.test != \'\' )", true, false)'
+        '$session.params.test != \'\' )","true","false")'
+    )
+
+def test_context_with_double_ternary():
+    result = expression_translation.translate_context(
+        "<? ($testData && $testData.test) ||"
+        " ($test && $test != \"\") ? ($testData2 && $testData2.test) ||"
+        " ($test2 && $test2 != \"\") ? true : false : false ?>")
+    print(result)
+    assert result == (
+        '$sys.func.IF("( $session.params.testData != null'
+        ' AND $session.params.testData.test != null ) OR'
+        ' ( $session.params.test != null AND '
+        '$session.params.test != \'\' )",'
+        '"$sys.func.IF("( $session.params.testData2 != null'
+        ' AND $session.params.testData2.test != null ) OR'
+        ' ( $session.params.test2 != null AND '
+        '$session.params.test2 != \'\' )","true","false")","false")'
     )
 
 def test_context_with_text_and_function():
